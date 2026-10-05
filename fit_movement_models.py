@@ -69,6 +69,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--save-coefficients",
+        action="store_true",
+        help=("Save full/task_movement outer-fold weights and transformation metadata "
+              "for analysis without regression refitting. Existing completed fits "
+              "without coefficients require --refit or a new --output-root."),
+    )
+    parser.add_argument(
         "--retry-failed",
         action="store_true",
         help=(
@@ -329,6 +336,7 @@ def main():
         registry=registry,
         n_jobs=args.n_jobs,
         ablation_mode=args.ablation_mode,
+        save_coefficients=args.save_coefficients,
     )
     print("\nRun summary:")
     print(summary.to_string(index=False))

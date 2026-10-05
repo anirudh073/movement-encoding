@@ -35,6 +35,7 @@ from movement_encoding import (
     run_nested_outer_cv_poisson_ridge,
 )
 from movement_features import DEFAULT_PAW_PREFIXES
+from movement_model_artifacts import pack_fold_coefficients
 
 
 BUNDLE_VERSION = 3
@@ -149,6 +150,20 @@ def export_movement_encoding_input_bundle(data: Mapping, bundle_dir):
         )
     if len(unit_ids) != spike_counts.shape[0]:
         raise ValueError("unit_ids length does not match spike_counts_common rows")
+    trial_type_selection = data.get("trial_type_selection")
+    if trial_type_selection not in {None, "both", "outbound", "inbound"}:
+        raise ValueError("Invalid trial_type_selection for movement input bundle")
+    if trial_type_selection in {"outbound", "inbound"}:
+        if "trial_type" not in covariates or not covariates["trial_type"].eq(
+            trial_type_selection
+        ).all():
+            raise ValueError(
+                f"Input bundle contains bins outside {trial_type_selection} trials"
+            )
+        if "trial_type" in (data.get("model_group") or {}).get("terms", ()):
+            raise ValueError(
+                "A single-direction model group cannot include trial_type"
+            )
 
     covariate_path = bundle_dir / _BUNDLE_FILES["covariates"]
     spike_path = bundle_dir / _BUNDLE_FILES["spike_counts"]
@@ -176,8 +191,15 @@ def export_movement_encoding_input_bundle(data: Mapping, bundle_dir):
         "spike_history_enabled": False,
         "outer_trial_folds": data["outer_trial_folds"],
     }
+    if data.get("sample_mode") is not None:
+        bundle_manifest["sample_mode"] = data["sample_mode"]
+    if data.get("trial_type_selection") is not None:
+        bundle_manifest["trial_type_selection"] = data["trial_type_selection"]
     if data.get("model_group") is not None:
         bundle_manifest["model_group"] = data["model_group"]
+    progress_method = data.get("distance_progress_method", covariates.attrs.get("distance_progress_method"))
+    if progress_method is not None:
+        bundle_manifest["distance_progress_method"] = progress_method
     _atomic_write_json(bundle_manifest, bundle_dir / "bundle_manifest.json")
     return bundle_manifest
 
@@ -570,6 +592,7 @@ def _fit_movement_unit_task(
     penalty_source_model=None,
     ablation_mode=None,
     progress_queue=None,
+    save_coefficients=False,
 ):
     """Fit one unit without writing shared artifacts; safe for joblib workers."""
     try:
@@ -691,6 +714,7 @@ def _fit_movement_unit_task(
                 ablation_mode=ablation_mode,
             ),
             "permutation_audit": cv_result.permutation_audit,
+            "coefficients": pack_fold_coefficients(cv_result.outer_fits) if save_coefficients else None,
         }
     except Exception as error:
         if progress_queue is not None:
@@ -865,6 +889,7 @@ def fit_movement_models_from_bundle(
     n_jobs: int = -1,
     show_progress: bool = True,
     ablation_mode: str = "shuffle",
+    save_coefficients: bool = False,
 ):
     """Fit requested registry models across all units of one frozen bundle.
 
@@ -874,6 +899,10 @@ def fit_movement_models_from_bundle(
     Workers fit independent units in parallel, while this parent process alone
     writes shared output files. Existing outputs are used only when their full
     saved run specification exactly matches the requested settings.
+
+    ``save_coefficients`` persists numerical full/task_movement fold weights
+    and feature metadata. Existing completed units without these artifacts
+    require an explicit refit or a new output root; they are never silently fit.
     """
     predictor_groups = bundle["manifest"]["predictor_groups"]
     registry = dict(registry or build_movement_model_registry(predictor_groups))
@@ -907,6 +936,7 @@ def fit_movement_models_from_bundle(
             if model_ablation_mode is not None else model_name
         )
         output_dir = output_root / output_name
+        save_model_coefficients = save_coefficients and model_name in ("full", "task_movement") and model_ablation_mode is None
         run_spec = _model_run_spec(
             bundle,
             model_name,
@@ -950,6 +980,17 @@ def fit_movement_models_from_bundle(
                     completed_unit_indices.difference(completed_with_shards)
                 )
 
+        if save_model_coefficients and not refit and not tables["unit_scores"].empty:
+            missing_coefficients = [
+                int(u) for u in tables["unit_scores"].loc[
+                    tables["unit_scores"].status.eq("completed"), "unit_index"]
+                if int(u) in skipped_unit_indices and not (
+                    output_dir / "coefficients" / f"unit_{int(u):04d}.json").exists()
+            ]
+            if missing_coefficients:
+                raise ValueError(
+                    f"{model_name}: {len(missing_coefficients)} completed units have no saved coefficients. "
+                    "Use a new --output-root or explicitly --refit with --save-coefficients.")
         pending_units = [
             (unit_index, unit_id)
             for unit_index, unit_id in enumerate(bundle["unit_ids"])
@@ -1028,12 +1069,16 @@ def fit_movement_models_from_bundle(
                     penalty_source_model,
                     model_ablation_mode,
                     progress_queue,
+                    save_coefficients=save_model_coefficients,
                 )
                 for unit_index, unit_id in pending_units
             )
             for worker_result in worker_results:
                 unit_index = worker_result["unit_index"]
                 unit_id = worker_result["unit_id"]
+                coefficient_path = output_dir / "coefficients" / f"unit_{unit_index:04d}.json"
+                # A rerun must never leave stale weights paired with new OOF rows.
+                coefficient_path.unlink(missing_ok=True)
                 _remove_oof_prediction_shard(output_dir, unit_index)
                 for table_name in tables:
                     tables[table_name] = _replace_unit_rows(
@@ -1049,6 +1094,12 @@ def fit_movement_models_from_bundle(
                         unit_index,
                         artifacts["oof_predictions"],
                     )
+                if worker_result.get("coefficients") is not None:
+                    coefficient_path.parent.mkdir(exist_ok=True)
+                    _atomic_write_json(dict(
+                        format_version=1, unit_index=int(unit_index), unit_id=str(unit_id),
+                        input_bundle_manifest_sha256=bundle["manifest_sha256"],
+                        run_spec=run_spec, folds=worker_result["coefficients"]), coefficient_path)
                 for table_name, artifact in artifacts.items():
                     if table_name == "oof_predictions":
                         continue

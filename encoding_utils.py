@@ -692,8 +692,15 @@ def renormalize_trial_progress_after_run_mask(
     return out
 
 
-def load_and_prepare_data(cfg=None):
+def load_and_prepare_data(cfg=None, sample_mode="masked", trial_type_selection="both"):
     """Load position + spikes, bin, filter, scale.
+
+    ``masked`` keeps run-zone bins and renormalizes progress within each run.
+    ``unmasked`` keeps outbound/inbound bins regardless of zone and retains
+    the original full-trial distance progress. Both modes apply the same
+    speed, position, memory, and downstream complete-case filters. Select
+    ``outbound`` or ``inbound`` to fit only that trial type; memory is assigned
+    from the full trial sequence before this selection.
 
     Returns a dict with keys:
         cov_df_common, cov_df_out_common,
@@ -701,6 +708,12 @@ def load_and_prepare_data(cfg=None):
         unit_ids, bin_centers,
         scaling_params  — dict with pos_min, pos_max, speed_min, speed_max
     """
+    if sample_mode not in {"masked", "unmasked"}:
+        raise ValueError("sample_mode must be 'masked' or 'unmasked'")
+    if trial_type_selection not in {"both", "outbound", "inbound"}:
+        raise ValueError(
+            "trial_type_selection must be 'both', 'outbound', or 'inbound'"
+        )
     cfg = cfg or CONFIG
     base_dir = cfg["base_dir"]
     bin_size = cfg["bin_size"]
@@ -716,6 +729,20 @@ def load_and_prepare_data(cfg=None):
             "Fixed geometry-derived branch scaling is currently defined only "
             "for Wtrack_center0_wilbur20210512"
         )
+    # Recompute from ORIGINAL video-rate positions. The old CSV progress only
+    # subtracted display gaps, counting an unrelated arm at the lower T branch.
+    # Scalar linear positions interpolated across edges cannot repair this.
+    if __package__:
+        from .graph_distance import recompute_graph_progress
+    else:
+        from graph_distance import recompute_graph_progress
+    trialized_position = recompute_graph_progress(
+        trialized_position.sort_index(),
+        node_positions=WILBUR_WTRACK_CENTER0_NODE_POSITIONS,
+        linear_edge_order=WILBUR_WTRACK_CENTER0_LINEAR_EDGE_ORDER,
+        edge_spacing=WTRACK_CENTER0_LINEAR_EDGE_SPACING,
+        segment_order=WILBUR_WTRACK_CENTER0_TRACK_SEGMENT_ORDER,
+    ).drop(columns='graph_distance_since_trial_start_cm')
     seg_bounds = WILBUR_WTRACK_CENTER0_FIXED_SEGMENT_BOUNDS
     data = np.load(f"{base_dir}/analysis/final_spikes/mfpc_spikes.npz",
                    allow_pickle=True)
@@ -756,21 +783,43 @@ def load_and_prepare_data(cfg=None):
     # NaN out bins that fall outside any epoch's time range
     epoch_ranges = trialized_position.groupby("epoch").apply(
         lambda g: (g.index.min(), g.index.max()))
+    # Epoch 4 of this session mislabels a ~1327s sleep/rest period as part of
+    # the run epoch: raw position tracking has a genuine gap from
+    # EPOCH_4_SLEEP_GAP_START to ~1620848027.2 with no real behavior in
+    # between. interp_col() is a plain np.interp with no gap protection, so
+    # bins inside that gap were getting fabricated speed/position values from
+    # a straight line drawn across the full ~22 minutes — 621,142 bins
+    # (46.7% of cov_df_common) of non-existent "behavior." Stop epoch 4 at
+    # the last real sample before the gap; no-op if the source data changes
+    # and no longer extends past it.
+    EPOCH_4_SLEEP_GAP_START = 1620846699.8111782
+    if 4.0 in epoch_ranges.index:
+        epoch_4_start, epoch_4_end = epoch_ranges.loc[4.0]
+        if epoch_4_end > EPOCH_4_SLEEP_GAP_START:
+            epoch_ranges.loc[4.0] = (epoch_4_start, EPOCH_4_SLEEP_GAP_START)
     in_epoch = np.zeros(len(bin_centers), dtype=bool)
     for t_start, t_end in epoch_ranges.values:
         in_epoch |= (bin_centers >= t_start) & (bin_centers <= t_end)
     if not in_epoch.all():
         interp_pos.loc[~in_epoch] = np.nan
 
-    # base mask: run zone, outbound + inbound
-    base_mask = (
-        (interp_pos["zone"] == "run")
-        & (interp_pos["trial_type"].isin(["outbound", "inbound"]))
-    )
+    # The unmasked fit keeps the same trial types without selecting run zones.
+    base_mask = interp_pos["trial_type"].isin(["outbound", "inbound"])
+    if sample_mode == "masked":
+        base_mask &= interp_pos["zone"].eq("run")
     cov_df = interp_pos[base_mask].rename(columns={"left/right": "choice"})
-    cov_df = renormalize_trial_progress_after_run_mask(cov_df)
+    if sample_mode == "masked":
+        cov_df = renormalize_trial_progress_after_run_mask(cov_df)
     cov_df = _add_memory_column(cov_df)
     spike_counts_masked = spike_counts[:, base_mask]
+    if trial_type_selection != "both":
+        selected_trial_bins = cov_df["trial_type"].eq(trial_type_selection)
+        cov_df = cov_df.loc[selected_trial_bins].copy()
+        spike_counts_masked = spike_counts_masked[:, selected_trial_bins.to_numpy()]
+        if cov_df.empty:
+            raise ValueError(
+                f"No {trial_type_selection} samples remain after the base mask"
+            )
     unit_ids = np.arange(len(spike_counts_masked))
 
     # common mask: speed + position filters + memory (ensures equal rows across all models)
@@ -816,7 +865,14 @@ def load_and_prepare_data(cfg=None):
     )
     spike_counts_correct = spike_counts[:, correct_mask]
 
+    for frame in (cov_df_common, cov_df_out_common, cov_df_correct):
+        frame.attrs['distance_progress_method'] = 'cumulative_shortest_graph_path_v1'
+        frame.attrs['distance_progress_source'] = str(cfg['trialized_position'])
+
     return dict(
+        distance_progress_method = 'cumulative_shortest_graph_path_v1',
+        sample_mode         = sample_mode,
+        trial_type_selection = trial_type_selection,
         cov_df_correct       = cov_df_correct,
         spike_counts_correct = spike_counts_correct,
         cov_df_common        = cov_df_common,

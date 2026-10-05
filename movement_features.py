@@ -1109,6 +1109,29 @@ def derive_movement_features(
         lateral_signal_smoothed
     )
 
+    # Reject implausible-magnitude values in the differentiated body/paw-frame
+    # features. These arise at the edges of brief raw-tracking dropouts, where
+    # _smooth_by_group's window spans a discontinuity and the subsequent
+    # differentiation produces a transient spike rather than a NaN (unlike a
+    # missing sample, which already propagates to NaN). Observed on this
+    # session: 235 bins (0.05% of the GLM's common-mask population) with
+    # |z|>10 in these columns specifically, e.g. body_angular_velocity_rad_s
+    # up to +/-260 rad/s against a mean/std of 0.02/2.45 -- not a physically
+    # possible turning rate. A plain .notna() completeness check does not
+    # catch these, since the value is finite, just wrong. Flag with a
+    # standard-score threshold rather than hardcoding session-specific bounds.
+    IMPLAUSIBLE_Z_THRESHOLD = 10.0
+    for column in (
+        "body_angular_velocity_rad_s",
+        "relative_paw_vigor",
+        "fore_minus_hind_vigor",
+    ):
+        values = features[column].to_numpy(dtype=float)
+        mean, std = np.nanmean(values), np.nanstd(values)
+        if std > 0:
+            implausible = np.abs((values - mean) / std) > IMPLAUSIBLE_Z_THRESHOLD
+            features.loc[implausible, column] = np.nan
+
     if return_gait_events and return_lateral_phase_events:
         return features, gait_events, lateral_phase_events
     if return_gait_events:

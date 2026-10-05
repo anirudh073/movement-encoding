@@ -221,11 +221,13 @@ def build_movement_predictor_groups(paw_prefixes: Mapping):
         raise ValueError(
             "paw_prefixes is missing required paws: " f"{sorted(missing_paws)}"
         )
+    # gait_phase_sin/cos and lateral_phase_sin/cos are excluded: they are
+    # undefined outside accepted stride/cycle intervals (24.1%/9.9% of
+    # frames), and requiring them alongside these columns in the shared
+    # completeness mask drops the vast majority of otherwise-valid bins.
+    # They remain derived and interpolated into every covariate table for a
+    # separately scoped phase analysis (see movement_encoding_model_plan.md).
     limb_columns = (
-        "gait_phase_sin",
-        "gait_phase_cos",
-        "lateral_phase_sin",
-        "lateral_phase_cos",
         "relative_paw_vigor",
         "fore_minus_hind_vigor",
         "mean_stance_width",
@@ -3267,6 +3269,7 @@ def summarize_task_predictor_dependence(
     branch_pos_df: int = 4,
     n_splits: int = 5,
     ridge_alpha: float = 1.0,
+    include_trial_type: bool = True,
 ) -> pd.DataFrame:
     """Break down how well each behavioral variable is predicted by task predictors.
 
@@ -3282,12 +3285,12 @@ def summarize_task_predictor_dependence(
       lower_bound=0, upper_bound=1):C(branch_id)`` — the exact branch-specific
       position term the encoding models use
       (``encoding_utils.load_and_prepare_data``'s position formula).
-    - ``trial_type``: ``C(trial_type)``.
-    - ``all_three``: all of the above combined.
+    - ``trial_type``: ``C(trial_type)`` when both directions are analyzed.
+    - ``all_three``: all three combined when both directions are analyzed.
+    - ``progress_position``: progress and position combined when analyzing
+      only one direction.
 
-    Outbound and inbound trials are pooled throughout, since ``trial_type``
-    is itself one of the predictors being evaluated here. A high
-    ``all_three`` R^2 that isn't matched by any single column flags a
+    A high combined R² that isn't matched by any single column flags a
     variable that is jointly, but not individually, redundant with the task
     predictors. Requires ``branch_id``/``branch_pos_scaled`` already added
     (e.g. via ``encoding_utils._add_branch_position_columns``).
@@ -3322,11 +3325,14 @@ def summarize_task_predictor_dependence(
     formulas = {
         "progress": progress_formula,
         "position": position_formula,
-        "trial_type": trial_type_formula,
-        "all_three": (
-            f"{trial_type_formula} + {progress_formula} + {position_formula}"
-        ),
     }
+    if include_trial_type:
+        formulas["trial_type"] = trial_type_formula
+        formulas["all_three"] = (
+            f"{trial_type_formula} + {progress_formula} + {position_formula}"
+        )
+    else:
+        formulas["progress_position"] = f"{progress_formula} + {position_formula}"
 
     trial_ids = data[trial_col]
     rows = []
